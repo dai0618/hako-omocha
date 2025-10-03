@@ -12,7 +12,30 @@ function toOAHistory(history: ChatMessage[]): OAMessage[] {
   }))
 }
 
-// ---- Gemini i2i（text+image→image 一発変換）----
+/* =========================
+   Gemini i2i 用の型定義
+   ========================= */
+type GeminiInlineData = {
+  mimeType?: string
+  data: string
+}
+type GeminiPart = {
+  text?: string
+  inlineData?: GeminiInlineData
+}
+type GeminiContent = { parts: GeminiPart[] }
+type GeminiCandidate = {
+  content?: GeminiContent
+  finishReason?: string
+  safetyRatings?: unknown
+}
+type GeminiResponse = {
+  candidates?: GeminiCandidate[]
+}
+
+/* =========================
+   画像のBase64化（dataURL / URL どちらもOK）
+   ========================= */
 async function loadImageAsBase64(input: string): Promise<{ mime: string; base64: string }> {
   if (input.startsWith('data:')) {
     const m = input.match(/^data:([^;]+);base64,(.+)$/)
@@ -26,7 +49,9 @@ async function loadImageAsBase64(input: string): Promise<{ mime: string; base64:
   return { mime: blob.type || 'image/png', base64: buf.toString('base64') }
 }
 
-
+/* =========================
+   Gemini 画像変換（text+image→image）
+   ========================= */
 async function generateImageTransformDataUrlGemini(
   inputImageUrlOrDataUrl: string,
   promptText = 'おもちゃタウンで遊んでいるおもちゃの様子。玩具の見た目は入力画像を忠実に維持。背景はカラフルで活気のある街並み。光は明るくポップ、広告風。正方形で高精細。'
@@ -34,27 +59,11 @@ async function generateImageTransformDataUrlGemini(
   const GEMINI_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY
   if (!GEMINI_KEY) throw new Error('Gemini API key not set')
 
-  // 1) モデル名：プレビュー環境なら "gemini-2.5-flash-image-preview" の必要がある場合あり
-  const model =
-    process.env.GEMINI_IMAGE_MODEL ||
-    'gemini-2.5-flash-image' // ダメなら 'gemini-2.5-flash-image-preview' を試す
+  const model = process.env.GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image'
 
-  // 2) 入力画像 → base64
-  const { mime, base64 } = await (async () => {
-    if (inputImageUrlOrDataUrl.startsWith('data:')) {
-      const m = inputImageUrlOrDataUrl.match(/^data:([^;]+);base64,(.+)$/)
-      if (!m) throw new Error('Invalid data URL')
-      return { mime: m[1], base64: m[2] }
-    } else {
-      const r = await fetch(inputImageUrlOrDataUrl)
-      if (!r.ok) throw new Error(`fetch input image failed: ${r.status}`)
-      const blob = await r.blob()
-      const buf = Buffer.from(await blob.arrayBuffer())
-      return { mime: blob.type || 'image/png', base64: buf.toString('base64') }
-    }
-  })()
+  // 入力画像 → base64 & mime
+  const { mime, base64 } = await loadImageAsBase64(inputImageUrlOrDataUrl)
 
-  // 3) 画像“を”返すように明示。1:1も generationConfig で指定
   const resp = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
     {
@@ -76,8 +85,8 @@ async function generateImageTransformDataUrlGemini(
           },
         ],
         generationConfig: {
-          responseModalities: ['IMAGE'],   // ← 画像のみを要求（テキスト混在を避ける）
-          imageConfig: { aspectRatio: '1:1' }, // ← 正方形を明示
+          responseModalities: ['IMAGE'],      // 画像を返すことを明示
+          imageConfig: { aspectRatio: '1:1' }, // 正方形
         },
       }),
     }
@@ -88,40 +97,34 @@ async function generateImageTransformDataUrlGemini(
     throw new Error(`[gemini i2i failed] ${t.slice(0, 800)}`)
   }
 
-  const j: any = await resp.json()
+  const j = (await resp.json()) as unknown as GeminiResponse
+  const cand = j.candidates?.[0]
+  const parts = cand?.content?.parts ?? []
 
-  // --- セーフティ/終了理由を見ておくと原因特定が速い ---
-  const cand = j?.candidates?.[0]
-  const finish = cand?.finishReason
-  const safety = cand?.safetyRatings
-  if (finish && finish !== 'FINISH_REASON_UNSPECIFIED' && finish !== 'STOP') {
-    console.warn('[gemini finishReason]', finish)
-  }
-  if (Array.isArray(safety)) {
-    console.warn('[gemini safetyRatings]', JSON.stringify(safety))
-  }
+  // 型ガード：inlineData を持つ Part だけ通す
+  const imagePart = parts.find(
+    (p): p is GeminiPart & { inlineData: GeminiInlineData } => Boolean(p.inlineData?.data)
+  )
 
-  // 画像 part を探す（テキスト part しかないケースに備える）
-  const parts: any[] = cand?.content?.parts || []
-  const imagePart = parts.find((p) => p?.inlineData?.data)
-
-  // テキストしか返ってない場合、診断情報を投げる
   if (!imagePart) {
-    const textPart = parts.find((p) => typeof p?.text === 'string')
-    const msg =
-      'No image in Gemini response' +
-      (textPart ? ` (text="${String(textPart.text).slice(0, 200)}...")` : '') +
+    const textPart = parts.find((p) => typeof p.text === 'string')?.text
+    const finish = cand?.finishReason
+    const safety = cand?.safetyRatings
+    const diag =
+      (textPart ? ` text="${String(textPart).slice(0, 120)}..."` : '') +
       (finish ? ` finishReason=${finish}` : '') +
       (safety ? ` safety=${JSON.stringify(safety)}` : '')
-    throw new Error(msg)
+    throw new Error(`No image in Gemini response${diag}`)
   }
 
-  const outB64: string = imagePart.inlineData.data
-  const outMime: string = imagePart.inlineData.mimeType || 'image/png'
+  const outB64 = imagePart.inlineData.data
+  const outMime = imagePart.inlineData.mimeType || 'image/png'
   return `data:${outMime};base64,${outB64}`
 }
 
-// ---- メイン処理：チャットはOpenAI、画像だけGemini ----
+/* =========================
+   メインの POST：ChatGPT はOpenAIのまま
+   ========================= */
 export async function POST(req: NextRequest) {
   try {
     const { toys, history, userInput, firstRoundImage, firstToyId } = (await req.json()) as {
@@ -140,7 +143,7 @@ export async function POST(req: NextRequest) {
     ]
     const baseHistory = toOAHistory(history || [])
 
-    // --- ユーザーの自由入力に対する返信（OpenAIのまま）---
+    // ユーザー自由入力 → OpenAI
     if (userInput) {
       const t = toys[0]
       const prompt: OAMessage[] = [
@@ -154,6 +157,7 @@ export async function POST(req: NextRequest) {
           ],
         },
       ]
+
       const r = await fetch('https://api.openai.com/v1/responses', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
@@ -161,17 +165,19 @@ export async function POST(req: NextRequest) {
       })
       const j = (await r.json()) as OAResponse
       const text = j.output?.[0]?.content?.[0]?.text || 'うんうん！'
+
       return NextResponse.json({ replies: [{ role: 'toy', name: t.name, content: text, toyId: t.id }] })
     }
 
-    // --- 通常ラウンド（各おもちゃの短文 + 最初の1体だけ画像変換）---
+    // 通常ラウンド
     const replies: ChatMessage[] = []
     for (const toy of toys) {
       const isRep = Boolean(firstRoundImage && firstToyId && toy.id === firstToyId)
 
+      // チャット（OpenAI）
       const content: Array<{ type: 'input_text' | 'input_image'; text?: string; image_url?: string }> = [
         { type: 'input_text', text: `あなたは ${toy.name}。口調: ${toy.personality.speaking_style}。性格: ${(toy.personality.traits || []).join('、')}` },
-        { type: 'input_text', text: isRep ? '最初のラリーでは「片付けてくれたお礼」+「おもちゃタウンで遊ぶ自分」を想像して、ワクワク感のある一言を。' : '短くチャットの文脈に沿った一言を。' },
+        { type: 'input_text', text: isRep ? '最初のラリーでは「おもちゃタウンで遊ぶ自分」を想像して、ワクワク感のある一言を。' : '短くチャットの文脈に沿った一言を。' },
       ]
       if (isRep && firstRoundImage) {
         content.unshift(
@@ -189,6 +195,7 @@ export async function POST(req: NextRequest) {
       const jj = (await rr.json()) as OAResponse
       const text = jj.output?.[0]?.content?.[0]?.text || (isRep ? 'おもちゃタウンであそぼう！' : 'ピカピカでうれしい！')
 
+      // 画像（Gemini）
       let generatedImageDataUrl: string | undefined
       if (isRep && firstRoundImage) {
         try {
