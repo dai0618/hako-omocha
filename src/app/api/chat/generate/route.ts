@@ -1,3 +1,4 @@
+// /src/app/api/chat/generate/route.ts
 import { NextRequest, NextResponse } from 'next/server'
 import type { ChatMessage, OAMessage, OAResponse, Toy } from '@/types'
 
@@ -11,119 +12,116 @@ function toOAHistory(history: ChatMessage[]): OAMessage[] {
   }))
 }
 
-async function buildImagePromptFromToy(firstRoundImage: string, toyName: string): Promise<string> {
-  const resp = await fetch('https://api.openai.com/v1/responses', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-      input: [
-        {
-          role: 'user',
-          content: [
-            { type: 'input_text', text:
-              `次の画像は玩具${toyName}です。見た目を観察して「おもちゃタウンで遊ぶ自分」を1枚絵で描くための画像生成プロンプトを日本語で作成。` +
-              `背景はカラフルなおもちゃタウン。本文のみ出力。` },
-            { type: 'input_image', image_url: firstRoundImage },
-          ],
-        },
-      ],
-    }),
-  })
-  if (!resp.ok) throw new Error(`prompt-build failed: ${(await resp.text()).slice(0, 300)}`)
-  const json = (await resp.json()) as OAResponse
-  return json?.output?.[0]?.content?.[0]?.text || 'おもちゃタウンで楽しく遊ぶ玩具のイラスト。'
-}
-
-/** OpenAI または Replicate を使って data URL を返す */
-async function generateImageDataUrl(prompt: string): Promise<string> {
-  const provider = process.env.IMAGE_PROVIDER || 'openai'
-  if (provider === 'openai') {
-    const resp = await fetch('https://api.openai.com/v1/images/generations', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1',
-        prompt,
-        size: '1024x1024',
-        n: 1,
-      }),
-    })
-    if (resp.ok) {
-      const j: unknown = await resp.json()
-      const json = j as { data?: Array<{ b64_json?: string; url?: string }> }
-      const b64 = json.data?.[0]?.b64_json
-      if (b64) return `data:image/png;base64,${b64}`
-      const url = json.data?.[0]?.url
-      if (url) {
-        const i = await fetch(url)
-        if (!i.ok) throw new Error('fetch image url failed')
-        const blob = await i.blob()
-        const buf = Buffer.from(await blob.arrayBuffer())
-        return `data:${blob.type || 'image/png'};base64,${buf.toString('base64')}`
-      }
-      // OpenAI が権限で弾かれた/無データ → Replicateへフォールバック
-      console.warn('[image-gen openai] no data, fallback to replicate')
-    } else {
-      const t = await resp.text()
-      console.warn('[image-gen openai failed]', t.slice(0, 200))
-      // フォールバックに進む
-    }
+// ---- Gemini i2i（text+image→image 一発変換）----
+async function loadImageAsBase64(input: string): Promise<{ mime: string; base64: string }> {
+  if (input.startsWith('data:')) {
+    const m = input.match(/^data:([^;]+);base64,(.+)$/)
+    if (!m) throw new Error('Invalid data URL')
+    return { mime: m[1], base64: m[2] }
   }
-
-  // Replicate フォールバック
-  const token = process.env.REPLICATE_API_TOKEN
-  if (!token) throw new Error('REPLICATE_API_TOKEN is missing')
-  const version = process.env.REPLICATE_MODEL || 'stability-ai/sdxl' // 可能なら versionID を指定
-
-  // 予測作成
-  const createdResp = await fetch('https://api.replicate.com/v1/predictions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      version,
-      input: { prompt, width: 1024, height: 1024 },
-    }),
-  })
-  if (!createdResp.ok) throw new Error(`replicate create failed: ${(await createdResp.text()).slice(0, 300)}`)
-  const created: { id: string } = await createdResp.json()
-
-  // ポーリング
-  let status = 'starting'
-  let outputUrl: string | undefined
-  for (let i = 0; i < 40; i++) {
-    const r = await fetch(`https://api.replicate.com/v1/predictions/${created.id}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    })
-    if (!r.ok) throw new Error('replicate poll failed')
-    const p: { status: string; output?: unknown } = await r.json()
-    status = p.status
-    if (status === 'succeeded') {
-      if (Array.isArray(p.output) && p.output.length > 0 && typeof p.output[0] === 'string') {
-        outputUrl = p.output[0] as string
-      } else if (typeof p.output === 'string') {
-        outputUrl = p.output as string
-      }
-      break
-    }
-    if (status === 'failed' || status === 'canceled') throw new Error('replicate job failed')
-    await new Promise((res) => setTimeout(res, 1000))
-  }
-  if (!outputUrl) throw new Error('replicate returned no image url')
-
-  const img = await fetch(outputUrl)
-  if (!img.ok) throw new Error('replicate fetch image failed')
-  const blob = await img.blob()
+  const r = await fetch(input)
+  if (!r.ok) throw new Error(`fetch input image failed: ${r.status}`)
+  const blob = await r.blob()
   const buf = Buffer.from(await blob.arrayBuffer())
-  return `data:${blob.type || 'image/png'};base64,${buf.toString('base64')}`
+  return { mime: blob.type || 'image/png', base64: buf.toString('base64') }
 }
 
+
+async function generateImageTransformDataUrlGemini(
+  inputImageUrlOrDataUrl: string,
+  promptText = 'おもちゃタウンで遊んでいるおもちゃの様子。玩具の見た目は入力画像を忠実に維持。背景はカラフルで活気のある街並み。光は明るくポップ、広告風。正方形で高精細。'
+): Promise<string> {
+  const GEMINI_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY
+  if (!GEMINI_KEY) throw new Error('Gemini API key not set')
+
+  // 1) モデル名：プレビュー環境なら "gemini-2.5-flash-image-preview" の必要がある場合あり
+  const model =
+    process.env.GEMINI_IMAGE_MODEL ||
+    'gemini-2.5-flash-image' // ダメなら 'gemini-2.5-flash-image-preview' を試す
+
+  // 2) 入力画像 → base64
+  const { mime, base64 } = await (async () => {
+    if (inputImageUrlOrDataUrl.startsWith('data:')) {
+      const m = inputImageUrlOrDataUrl.match(/^data:([^;]+);base64,(.+)$/)
+      if (!m) throw new Error('Invalid data URL')
+      return { mime: m[1], base64: m[2] }
+    } else {
+      const r = await fetch(inputImageUrlOrDataUrl)
+      if (!r.ok) throw new Error(`fetch input image failed: ${r.status}`)
+      const blob = await r.blob()
+      const buf = Buffer.from(await blob.arrayBuffer())
+      return { mime: blob.type || 'image/png', base64: buf.toString('base64') }
+    }
+  })()
+
+  // 3) 画像“を”返すように明示。1:1も generationConfig で指定
+  const resp = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_KEY },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              {
+                text:
+                  `${promptText}\n` +
+                  '- 被写体は入力画像の玩具\n' +
+                  '- 不自然な改変は避け、玩具の特徴は保持\n' +
+                  '- 子ども向けに明るく楽しい雰囲気',
+              },
+              { inlineData: { mimeType: mime, data: base64 } },
+            ],
+          },
+        ],
+        generationConfig: {
+          responseModalities: ['IMAGE'],   // ← 画像のみを要求（テキスト混在を避ける）
+          imageConfig: { aspectRatio: '1:1' }, // ← 正方形を明示
+        },
+      }),
+    }
+  )
+
+  if (!resp.ok) {
+    const t = await resp.text()
+    throw new Error(`[gemini i2i failed] ${t.slice(0, 800)}`)
+  }
+
+  const j: any = await resp.json()
+
+  // --- セーフティ/終了理由を見ておくと原因特定が速い ---
+  const cand = j?.candidates?.[0]
+  const finish = cand?.finishReason
+  const safety = cand?.safetyRatings
+  if (finish && finish !== 'FINISH_REASON_UNSPECIFIED' && finish !== 'STOP') {
+    console.warn('[gemini finishReason]', finish)
+  }
+  if (Array.isArray(safety)) {
+    console.warn('[gemini safetyRatings]', JSON.stringify(safety))
+  }
+
+  // 画像 part を探す（テキスト part しかないケースに備える）
+  const parts: any[] = cand?.content?.parts || []
+  const imagePart = parts.find((p) => p?.inlineData?.data)
+
+  // テキストしか返ってない場合、診断情報を投げる
+  if (!imagePart) {
+    const textPart = parts.find((p) => typeof p?.text === 'string')
+    const msg =
+      'No image in Gemini response' +
+      (textPart ? ` (text="${String(textPart.text).slice(0, 200)}...")` : '') +
+      (finish ? ` finishReason=${finish}` : '') +
+      (safety ? ` safety=${JSON.stringify(safety)}` : '')
+    throw new Error(msg)
+  }
+
+  const outB64: string = imagePart.inlineData.data
+  const outMime: string = imagePart.inlineData.mimeType || 'image/png'
+  return `data:${outMime};base64,${outB64}`
+}
+
+// ---- メイン処理：チャットはOpenAI、画像だけGemini ----
 export async function POST(req: NextRequest) {
   try {
     const { toys, history, userInput, firstRoundImage, firstToyId } = (await req.json()) as {
@@ -142,7 +140,7 @@ export async function POST(req: NextRequest) {
     ]
     const baseHistory = toOAHistory(history || [])
 
-    // ユーザー入力優先
+    // --- ユーザーの自由入力に対する返信（OpenAIのまま）---
     if (userInput) {
       const t = toys[0]
       const prompt: OAMessage[] = [
@@ -156,7 +154,6 @@ export async function POST(req: NextRequest) {
           ],
         },
       ]
-
       const r = await fetch('https://api.openai.com/v1/responses', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
@@ -167,13 +164,14 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ replies: [{ role: 'toy', name: t.name, content: text, toyId: t.id }] })
     }
 
-    // 通常ラウンド
+    // --- 通常ラウンド（各おもちゃの短文 + 最初の1体だけ画像変換）---
     const replies: ChatMessage[] = []
     for (const toy of toys) {
       const isRep = Boolean(firstRoundImage && firstToyId && toy.id === firstToyId)
+
       const content: Array<{ type: 'input_text' | 'input_image'; text?: string; image_url?: string }> = [
         { type: 'input_text', text: `あなたは ${toy.name}。口調: ${toy.personality.speaking_style}。性格: ${(toy.personality.traits || []).join('、')}` },
-        { type: 'input_text', text: isRep ? '最初のラリーでは「おもちゃタウンで遊ぶ自分」を想像して、ワクワク感のある一言を。' : '短くチャットの文脈に沿った一言を。' },
+        { type: 'input_text', text: isRep ? '最初のラリーでは「片付けてくれたお礼」+「おもちゃタウンで遊ぶ自分」を想像して、ワクワク感のある一言を。' : '短くチャットの文脈に沿った一言を。' },
       ]
       if (isRep && firstRoundImage) {
         content.unshift(
@@ -194,10 +192,16 @@ export async function POST(req: NextRequest) {
       let generatedImageDataUrl: string | undefined
       if (isRep && firstRoundImage) {
         try {
-          const imgPrompt = await buildImagePromptFromToy(firstRoundImage, toy.name)
-          generatedImageDataUrl = await generateImageDataUrl(imgPrompt)
+          generatedImageDataUrl = await generateImageTransformDataUrlGemini(
+            firstRoundImage,
+            'おもちゃタウンで遊んでいるおもちゃの様子。' +
+              '玩具の見た目は入力画像を忠実に維持。' +
+              '背景はカラフルで活気のある街並み。' +
+              '光は明るくポップ、広告風。' +
+              '正方形で高精細。'
+          )
         } catch (e) {
-          console.warn('image generation failed', e instanceof Error ? e.message : e)
+          console.warn('image transform failed', e instanceof Error ? e.message : e)
         }
       }
 
