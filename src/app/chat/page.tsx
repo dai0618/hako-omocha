@@ -114,23 +114,30 @@ export default function ChatPage() {
   // --- 丸アイコン（おもちゃ写真）解決ロジック ---
   // ChatMessage に toyId があれば最優先で該当Toyの image_url を使う。
   // なければ name で一致するToyを探す。見つからなければユーザー/デフォルトにフォールバック。
-  const getAvatarSrc = (m: ChatMessage): string => {
-    // toyId 優先
-    const byId = (m as any).toyId
-      ? toys.find((t) => t.id === (m as any).toyId)
-      : undefined
-    if (byId?.image_url) return byId.image_url
-
-    // name で推測
-    if (m.name) {
-      const byName = toys.find((t) => t.name === m.name)
-      if (byName?.image_url) return byName.image_url
+  type ChatMessageExtra = ChatMessage & {
+      toyId?: string
+      name?: string
+      imageDataUrl?: string
     }
 
-    // ロール別フォールバック
-    if (m.role === 'user') return '/user.png' // 任意のデフォルトユーザーアイコン（置いてなければ作成）
-    return '/toy.png' // 任意のデフォルトおもちゃアイコン（置いてなければ作成）
-  }
+    // 置き換え：any を使わない安全な実装
+    const getAvatarSrc = (m: ChatMessage): string => {
+      const mm = m as ChatMessageExtra
+
+      // toyId 優先
+      const byId = mm.toyId ? toys.find((t) => t.id === mm.toyId) : undefined
+      if (byId?.image_url) return byId.image_url
+
+      // name で推測
+      const nm = typeof mm.name === 'string' ? mm.name : undefined
+      if (nm) {
+        const byName = toys.find((t) => t.name === nm)
+        if (byName?.image_url) return byName.image_url
+      }
+
+      // ロール別フォールバック
+      return m.role === 'user' ? '/user.png' : '/toy.png'
+    }
 
   return (
     <main className="min-h-dvh flex flex-col" style={{ backgroundColor: '#fffcf0' }}>
