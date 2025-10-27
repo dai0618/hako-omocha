@@ -1,13 +1,11 @@
 'use client'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Image from 'next/image'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabaseClient'
 import type { Toy, ChatMessage } from '@/types'
 
-type GenerateResponse = {
-  replies: ChatMessage[]
-}
+type GenerateResponse = { replies: ChatMessage[] }
 
 export default function ChatPage() {
   const [toys, setToys] = useState<Toy[]>([])
@@ -15,6 +13,10 @@ export default function ChatPage() {
   const [round, setRound] = useState(0)
   const [busy, setBusy] = useState(false)
   const [input, setInput] = useState('')
+
+  // ★ Realtimeの購読完了フラグ & 自動発火の一度きり制御
+  const [subscribed, setSubscribed] = useState(false)
+  const firedOnceRef = useRef(false)
 
   // --- 初期ロード: おもちゃ一覧 ---
   useEffect(() => {
@@ -36,12 +38,38 @@ export default function ChatPage() {
           if (round === 0) void nextRound()
         }
       )
-      .subscribe()
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') setSubscribed(true) // ★購読完了
+      })
+
     return () => {
       supabase.removeChannel(ch)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [round, messages, toys])
+
+  // ★ /chat 入場時に自動でトリガーを押す（購読完了を待ってから一度だけ）
+  useEffect(() => {
+    const autoFire = async () => {
+      if (!subscribed) return
+      if (firedOnceRef.current) return
+      firedOnceRef.current = true
+
+      try {
+        const r = await fetch('/api/trigger', { method: 'POST' })
+        const j = await r.json().catch(() => ({}))
+        // 失敗 or ok:false の場合はフォールバックで直接開始
+        if (!r.ok || !j?.ok) {
+          if (round === 0) await nextRound()
+        }
+        // 成功時は Realtime の INSERT を拾って nextRound が動きます
+      } catch {
+        if (round === 0) await nextRound()
+      }
+    }
+    void autoFire()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subscribed])
 
   // Supabaseの画像URL→data URL(base64)
   const fetchAsDataUrl = async (url: string): Promise<string> => {
@@ -111,33 +139,19 @@ export default function ChatPage() {
     }
   }
 
-  // --- 丸アイコン（おもちゃ写真）解決ロジック ---
-  // ChatMessage に toyId があれば最優先で該当Toyの image_url を使う。
-  // なければ name で一致するToyを探す。見つからなければユーザー/デフォルトにフォールバック。
-  type ChatMessageExtra = ChatMessage & {
-      toyId?: string
-      name?: string
-      imageDataUrl?: string
+  // --- アバター解決 ---
+  type ChatMessageExtra = ChatMessage & { toyId?: string; name?: string; imageDataUrl?: string }
+  const getAvatarSrc = (m: ChatMessage): string => {
+    const mm = m as ChatMessageExtra
+    const byId = mm.toyId ? toys.find((t) => t.id === mm.toyId) : undefined
+    if (byId?.image_url) return byId.image_url
+    const nm = typeof mm.name === 'string' ? mm.name : undefined
+    if (nm) {
+      const byName = toys.find((t) => t.name === nm)
+      if (byName?.image_url) return byName.image_url
     }
-
-    // 置き換え：any を使わない安全な実装
-    const getAvatarSrc = (m: ChatMessage): string => {
-      const mm = m as ChatMessageExtra
-
-      // toyId 優先
-      const byId = mm.toyId ? toys.find((t) => t.id === mm.toyId) : undefined
-      if (byId?.image_url) return byId.image_url
-
-      // name で推測
-      const nm = typeof mm.name === 'string' ? mm.name : undefined
-      if (nm) {
-        const byName = toys.find((t) => t.name === nm)
-        if (byName?.image_url) return byName.image_url
-      }
-
-      // ロール別フォールバック
-      return m.role === 'user' ? '/user.png' : '/toy.png'
-    }
+    return m.role === 'user' ? '/user.png' : '/toy.png'
+  }
 
   return (
     <main className="min-h-dvh flex flex-col" style={{ backgroundColor: '#fffcf0' }}>
@@ -147,7 +161,7 @@ export default function ChatPage() {
           <Link href="/" aria-label="戻る" className="shrink-0">
             <Image src="/back.png" alt="back" width={28} height={28} priority />
           </Link>
-          <h2 className="text-xl font-bold leading-none">はこおもちゃ</h2>
+          <h2 className="text-xl font-bold leading-none">おもちゃズ</h2>
         </div>
       </header>
 
@@ -158,7 +172,6 @@ export default function ChatPage() {
           const avatar = getAvatarSrc(m)
           return (
             <li key={i} className={`flex items-start ${isUser ? 'justify-end' : 'justify-start'}`}>
-              {/* 左側（相手）/ 右側（自分）でアイコンの位置を切り替え */}
               {!isUser && (
                 <Image
                   src={avatar}
@@ -169,7 +182,6 @@ export default function ChatPage() {
                   unoptimized
                 />
               )}
-
               <div
                 className={`max-w-[78%] rounded-2xl px-3 py-2 text-sm leading-relaxed border
                 ${isUser ? 'bg-white/90 border-black/20' : 'bg-white/90 border-black/20'}`}
@@ -190,7 +202,6 @@ export default function ChatPage() {
                   </div>
                 )}
               </div>
-
               {isUser && (
                 <Image
                   src={avatar}
@@ -211,7 +222,7 @@ export default function ChatPage() {
         )}
       </ul>
 
-      {/* 送信バー（下固定・iOSセーフエリア） */}
+      {/* 送信バー（下固定） */}
       <div
         className="fixed left-0 right-0 bottom-0 border-t border-black/10 bg-[#02ad48] backdrop-blur
                   supports-[padding:max(0px)]:[padding-bottom:env(safe-area-inset-bottom)]"
@@ -234,19 +245,11 @@ export default function ChatPage() {
               title="送信"
               className="shrink-0 h-12 w-12 p-0 bg-transparent border-0 disabled:opacity-50"
             >
-              <Image
-                src="/send.png"
-                alt="send"
-                width={48}
-                height={48}
-                className="h-12 w-12 object-contain"
-                priority
-              />
+              <Image src="/send.png" alt="send" width={48} height={48} className="h-12 w-12 object-contain" priority />
             </button>
           </div>
         </div>
       </div>
-
     </main>
   )
 }
