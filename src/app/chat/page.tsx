@@ -215,9 +215,34 @@ export default function ChatPage() {
             </li>
           )
         })}
+        {/* メッセージリスト */}
+
+        {/* 5ラリー完了メッセージ（既存） */}
         {round >= 5 && (
           <li className="text-center text-xs text-gray-600 py-2">
             おもちゃ同士の会話は止まりました（5ラリー）。でも人間の入力には答えるよ。
+          </li>
+        )}
+
+        {/* ★ 考え中ぼこぼこ（生成中のみ表示） */}
+        {busy && (
+          <li className="flex items-start justify-start">
+            {/* 相手側のアバター（任意。使わないなら削除OK） */}
+            <Image
+              src="/toy.png"
+              alt=""
+              width={36}
+              height={36}
+              className="rounded-full mr-2 mt-0.5 border border-black/10"
+              unoptimized
+            />
+            <div className="max-w-[78%] rounded-2xl px-3 py-2 text-sm leading-relaxed border bg-white/90 border-black/20">
+              <div className="flex items-center gap-1 h-5">
+                <span className="inline-block w-2 h-2 rounded-full bg-black/40 animate-bounce" style={{ animationDelay: '0ms' }} />
+                <span className="inline-block w-2 h-2 rounded-full bg-black/40 animate-bounce" style={{ animationDelay: '150ms' }} />
+                <span className="inline-block w-2 h-2 rounded-full bg-black/40 animate-bounce" style={{ animationDelay: '300ms' }} />
+              </div>
+            </div>
           </li>
         )}
       </ul>
